@@ -1,0 +1,15 @@
+# 构建产物
+*.dll
+*.exe
+*.o
+*.obj
+
+# 中间渲染输出与截图
+*.png
+!docs/*.png
+
+# 编辑器 / 系统
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
