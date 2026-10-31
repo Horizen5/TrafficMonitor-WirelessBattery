@@ -357,13 +357,13 @@ static void UnionPathBounds(gp::RectF& acc, bool& has, gp::GraphicsPath& p, floa
 // 鼠标设计外框宽 37、高 51，缩放 s ≈ 14 * 0.98 / (51 + pen)
 //   pen 4.0 → 1.00px（发飘）   pen 6.0 → 1.44px（居中偏实）   pen 8.0 → 1.86px（最重）
 // 当前：鼠标轮廓取 D(8.0) 的一半 = 4.0，中缝/滚轮沿用 C 的 6.0 / 7.4。
-static const float PEN_MAIN  = 6.3f;   // 与 PEN_BAND 台阶对齐（两者实测厚度同为 1.50px）
+static const float PEN_MAIN  = 5.3f;   // 超采样下 14px 实测厚度 1.25px（与 PEN_BAND 同值）
 static const float PEN_SEAM  = 6.0f;
 static const float PEN_WHEEL = 7.4f;
 static const float PEN_CUP   = 0.0f;   // 耳罩只填充不描边
 // 耳机头梁单独一档：4.0 在浅底上呈 0.97px 几乎断线，加粗到 6.5（1.58px）才立得住。
 // 宽度方向由耳罩撑开、不是约束项，所以加粗头梁不会让整体缩水。
-static const float PEN_BAND  = 6.5f;
+static const float PEN_BAND  = 5.3f;
 
 // 渲染成 32bpp BGRA（直通 alpha），backgroundColor 先铺成目标色、alpha=0
 static void RenderIconBGRA(bool is_mouse, int size, COLORREF color, BYTE* out)
@@ -381,7 +381,12 @@ static void RenderIconBGRA(bool is_mouse, int size, COLORREF color, BYTE* out)
 
     if (!EnsureGdiplus()) return;
 
-    gp::Bitmap bmp(size, size, PixelFormat32bppARGB);
+    // 超采样：先按 SS 倍尺寸矢量绘制，再盒式降采样回 size。
+    // 直接按 14px 画时，GDI+ 会把笔画吸附到整像素/半像素，线宽只能取 1.00/1.50/1.75
+    // 三档；超采样后笔画宽度变成连续量（可精确到 0.01px）。
+    const int SS = 4;
+    const int BIG = size * SS;
+    gp::Bitmap bmp(BIG, BIG, PixelFormat32bppARGB);
     {
         gp::Graphics g(&bmp);
         g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
@@ -428,7 +433,8 @@ static void RenderIconBGRA(bool is_mouse, int size, COLORREF color, BYTE* out)
             //   耳机 pen=6.5 时必须落在 extra 0.22~0.36 这一段（墨迹在位图内为 2..12 共 11 行、中心 7.0），取 0.29。
             // 每次改线宽/形状都要重新实测这两个值。
             oy += is_mouse ? 0.5f : 0.29f;
-            gp::Matrix m(s, 0, 0, s, ox, oy);
+            const float f = (float)SS;
+            gp::Matrix m(s * f, 0, 0, s * f, ox * f, oy * f);
             g.SetTransform(&m);
 
             gp::Pen pen(gp::Color(255, 255, 255, 255), is_mouse ? PEN_MAIN : PEN_BAND);
@@ -457,14 +463,22 @@ static void RenderIconBGRA(bool is_mouse, int size, COLORREF color, BYTE* out)
     }
 
     gp::BitmapData bd;
-    gp::Rect rc(0, 0, size, size);
+    gp::Rect rc(0, 0, BIG, BIG);
     if (bmp.LockBits(&rc, gp::ImageLockModeRead, PixelFormat32bppARGB, &bd) == gp::Ok)
     {
         for (int y = 0; y < size; ++y)
         {
-            const BYTE* src = (const BYTE*)bd.Scan0 + (size_t)y * bd.Stride;
             for (int x = 0; x < size; ++x)
-                out[((size_t)y * size + x) * 4 + 3] = src[x * 4 + 3];
+            {
+                int acc = 0;
+                for (int dy = 0; dy < SS; ++dy)
+                {
+                    const BYTE* src = (const BYTE*)bd.Scan0 + (size_t)(y * SS + dy) * bd.Stride;
+                    for (int dx = 0; dx < SS; ++dx)
+                        acc += src[(x * SS + dx) * 4 + 3];
+                }
+                out[((size_t)y * size + x) * 4 + 3] = (BYTE)(acc / (SS * SS));
+            }
         }
         bmp.UnlockBits(&bd);
     }
