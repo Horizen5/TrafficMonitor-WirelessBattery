@@ -16,14 +16,14 @@ static inline float Vy(float y) { return 34.0f - (34.0f - y) * BAND_SQUASH; }
 
 static void AddCupPath(GraphicsPath& p, float cx)
 {
-    const float d  = cx - 8.5f;
-    const float x0 = 3.0f + d;
+    // 以头梁腿 cx 为轴两侧对称加宽（与插件 AddCupPath 一致）
     const float w  = 11.0f + CUP_INNER;
+    const float x0 = cx - w * 0.5f;
     const float x1 = x0 + w;
     const float yt = 31.5f, yb = 51.3f;
     const float r  = w * 0.5f;
     const float k  = 0.5523f * r;
-    const float mx = x0 + r;
+    const float mx = cx;
 
     p.AddBezier(Hx(mx), yt, Hx(mx + k), yt, Hx(x1), yt + r - k, Hx(x1), yt + r);
     p.AddLine(Hx(x1), yt + r, Hx(x1), yb - r);
@@ -66,7 +66,7 @@ static float FitTransform(Graphics& g, int size, const RectF& b, float fillW, fl
     return s;
 }
 
-static const float BAND_W[] = { 4.0f, 5.0f, 5.5f, 6.5f, 7.5f };
+static const float BAND_W[] = { 5.85f, 6.0f, 6.3f, 6.5f, 7.0f };
 static const int   NW = 5;
 
 static int GetEncoderClsid(const WCHAR* mime, CLSID* pClsid)
