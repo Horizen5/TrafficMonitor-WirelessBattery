@@ -155,6 +155,7 @@ TrafficMonitor 的两行行高不一定相同（实测鼠标行 15px、耳机行
 | `band_pen.cpp` | 扫描头梁笔宽的若干档位 |
 | `design.cpp` | 按样式表批量渲染预览图 |
 | `preview.cpp` | 渲染 14/16px 的变体位图 |
+| `bt_scan.cpp` | 用 Win32 蓝牙 API 做一次经典蓝牙（BR/EDR）inquiry，验证「电脑蓝牙能不能扫到周围设备」。`g++ -O2 -o bt_scan.exe bt_scan.cpp -lbthprops` |
 | `mk_*.py` | 把渲染结果拼成对比图（需要 Pillow） |
 
 编译预览工具：
