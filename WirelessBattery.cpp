@@ -38,11 +38,23 @@ static int g_mouse_val = -1;      // -1 表示读不到
 static int g_headset_val = -1;
 static wchar_t g_tooltip[256] = L"无线设备电量";
 
+// 鼠标当前的连接形态。AJ159 PRO 插上线充电时会以另一个 PID 重新枚举，
+// 厂商那个 65 字节 feature 通道从此只回显、不答话（实测扫了 0x00~0x7F 全部无响应），
+// 所以有线模式下拿不到电量，只能靠 PID 判断"在充电"。
+enum : int { MODE_NONE = 0, MODE_WIRELESS = 1, MODE_WIRED = 2 };
+static volatile LONG g_mouse_mode = MODE_NONE;
+
 static HANDLE g_thread = nullptr;
 static HANDLE g_stop_event = nullptr;
 static volatile LONG g_started = 0;
 
 static const DWORD REFRESH_SECONDS = 15;
+
+// 电量日志：只在数值/形态变化时追加一行，方便回看"电量是怎么掉下去的"
+static wchar_t g_log_path[MAX_PATH] = L"";
+static int g_logged_mouse = -2;      // -2 = 还没写过
+static int g_logged_headset = -2;
+static int g_logged_mode = -2;
 
 // 主程序通过 OnExtenedInfo 传来的数值文字颜色（0x00BBGGRR）
 static volatile LONG g_value_color = 0;
@@ -166,9 +178,11 @@ static HANDLE OpenHidDevice(unsigned short vid, unsigned short pid, unsigned sho
 
 // ---------------------------------------------------------------- 鼠标：AJAZZ
 
-static int ReadMouseBattery()
+// 按指定 PID 试着读一次电量，读不到返回 -1。
+// 无线（接收器 PID）用厂商 feature 协议；有线/充电 PID 下面是死路，见 ReadMouseBattery。
+static int TryReadAjazzBattery(unsigned short pid)
 {
-    HANDLE h = OpenHidDevice(0x3151, 0x402D, 0xFFFF, 0x02, true);
+    HANDLE h = OpenHidDevice(0x3151, pid, 0xFFFF, 0x02, true);
     if (h == INVALID_HANDLE_VALUE) return -1;
 
     int value = -1;
@@ -200,6 +214,25 @@ static int ReadMouseBattery()
 
     CloseHandle(h);
     return value;
+}
+
+static int ReadMouseBattery(int* mode_out)
+{
+    *mode_out = MODE_NONE;
+
+    // 1) 无线：接收器在，正常读电量
+    int v = TryReadAjazzBattery(0x402D);
+    if (v >= 0) { *mode_out = MODE_WIRELESS; return v; }
+
+    // 2) 有线/充电：设备还在，但换了 PID，且固件不回应任何命令。
+    //    这里不谎报 0%，交给上层显示"充电"。
+    HANDLE h = OpenHidDevice(0x3151, 0x4026, 0xFFFF, 0x02, true);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        CloseHandle(h);
+        *mode_out = MODE_WIRED;
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------- 耳机：MCHOSE
@@ -543,30 +576,110 @@ private:
     COLORREF m_color = CLR_INVALID;
 };
 
+// ---------------------------------------------------------------- 电量日志
+//
+// 只记录"变化"。目的：回答"下午还有 60% 多，怎么用着用着就没了"这种问题——
+// 靠回看日志里的时间戳和掉电曲线，能分清是电量读数跳变、还是真的耗得快。
+
+static void InitLogPath()
+{
+    wchar_t base[MAX_PATH] = L"";
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", base, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH) return;
+
+    wchar_t dir[MAX_PATH];
+    wsprintfW(dir, L"%s\\TrafficMonitor", base);
+    CreateDirectoryW(dir, nullptr);            // 已存在会返回失败，忽略
+    wsprintfW(g_log_path, L"%s\\battery.log", dir);
+}
+
+static void RotateLogIfBig()
+{
+    if (!g_log_path[0]) return;
+    WIN32_FILE_ATTRIBUTE_DATA fad{};
+    if (!GetFileAttributesExW(g_log_path, GetFileExInfoStandard, &fad)) return;
+    if (fad.nFileSizeLow < 512 * 1024) return;   // 512KB 封顶，留一份 .1
+    wchar_t old[MAX_PATH];
+    wsprintfW(old, L"%s.1", g_log_path);
+    MoveFileExW(g_log_path, old, MOVEFILE_REPLACE_EXISTING);
+}
+
+static void LogBattery(int mouse, int headset, int mode)
+{
+    if (!g_log_path[0]) return;
+    if (mouse == g_logged_mouse && headset == g_logged_headset && mode == g_logged_mode) return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    char mbuf[16], hbuf[16];
+    const char* mstr;
+    if (mouse >= 0) { wsprintfA(mbuf, "%d%%", mouse); mstr = mbuf; }
+    else mstr = (mode == MODE_WIRED) ? "charging" : "none";
+
+    const char* hstr;
+    if (headset >= 0) { wsprintfA(hbuf, "%d%%", headset); hstr = hbuf; }
+    else hstr = "none";
+
+    char line[192];
+    wsprintfA(line, "%04d-%02d-%02d %02d:%02d:%02d  mouse=%-8s headset=%-6s mode=%s\r\n",
+              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+              mstr, hstr,
+              mode == MODE_WIRELESS ? "wireless" : (mode == MODE_WIRED ? "wired" : "absent"));
+
+    RotateLogIfBig();
+
+    HANDLE f = CreateFileW(g_log_path, FILE_APPEND_DATA,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        WriteFile(f, line, (DWORD)lstrlenA(line), &written, nullptr);
+        CloseHandle(f);
+    }
+
+    g_logged_mouse = mouse;
+    g_logged_headset = headset;
+    g_logged_mode = mode;
+}
+
 // ---------------------------------------------------------------- 刷新线程
 
 static DWORD WINAPI RefreshThread(LPVOID)
 {
+    InitLogPath();
+
     while (WaitForSingleObject(g_stop_event, 0) == WAIT_TIMEOUT)
     {
-        int mouse = ReadMouseBattery();
+        int mode = MODE_NONE;
+        int mouse = ReadMouseBattery(&mode);
         int headset = ReadHeadsetBattery();
 
         EnterCriticalSection(&g_lock);
         g_mouse_val = mouse;
         g_headset_val = headset;
+        InterlockedExchange(&g_mouse_mode, mode);
 
-        if (mouse >= 0) wsprintfW(g_mouse_text, L"%d%%", mouse);
-        else            wcsncpy_s(g_mouse_text, L"--", _TRUNCATE);
+        if (mouse >= 0)                  wsprintfW(g_mouse_text, L"%d%%", mouse);
+        else if (mode == MODE_WIRED)     wcsncpy_s(g_mouse_text, L"充电", _TRUNCATE);
+        else                             wcsncpy_s(g_mouse_text, L"--", _TRUNCATE);
 
         if (headset >= 0) wsprintfW(g_headset_text, L"%d%%", headset);
         else              wcsncpy_s(g_headset_text, L"--", _TRUNCATE);
 
-        wsprintfW(g_tooltip, L"鼠标 %s  |  耳机 %s  (%s)",
-                  (mouse >= 0 ? g_mouse_text : L"读不到"),
-                  (headset >= 0 ? g_headset_text : L"读不到"),
-                  L"2.4G 直连读取");
+        wchar_t mdesc[48], hdesc[24];
+        if (mouse >= 0)                 wsprintfW(mdesc, L"%d%%", mouse);
+        else if (mode == MODE_WIRED)    wcsncpy_s(mdesc, L"充电中（有线模式读不到电量）", _TRUNCATE);
+        else                            wcsncpy_s(mdesc, L"未连接", _TRUNCATE);
+
+        if (headset >= 0) wsprintfW(hdesc, L"%d%%", headset);
+        else              wcsncpy_s(hdesc, L"未连接", _TRUNCATE);
+
+        wsprintfW(g_tooltip, L"鼠标：%s ｜ 耳机：%s", mdesc, hdesc);
         LeaveCriticalSection(&g_lock);
+
+        LogBattery(mouse, headset, mode);
 
         if (WaitForSingleObject(g_stop_event, REFRESH_SECONDS * 1000) != WAIT_TIMEOUT)
             break;
@@ -612,10 +725,9 @@ public:
     {
         if (!g_lock_ready) return L"--";
         EnterCriticalSection(&g_lock);
-        int v = m_is_mouse ? g_mouse_val : g_headset_val;
+        // 文字可能是 "86%"、"--" 或 "充电"，直接返回，不再按数值判空
         wcsncpy_s(m_buf, (m_is_mouse ? g_mouse_text : g_headset_text), _TRUNCATE);
         LeaveCriticalSection(&g_lock);
-        if (v < 0) return L"--";
         return m_buf;
     }
 
@@ -633,6 +745,10 @@ public:
         int tw = MulDiv(26, dpi, 96);
         if (hdc && GetTextExtentPoint32W(hdc, L"100%", 5, &sz))
             tw = sz.cx;
+        // "充电" 两个字可能比 "100%" 还宽，取大者，否则充电时文字会被裁
+        SIZE sz_zh{};
+        if (hdc && GetTextExtentPoint32W(hdc, L"充电", 2, &sz_zh) && sz_zh.cx > tw)
+            tw = sz_zh.cx;
         // 图标列宽固定 = 图标边长，鼠标/耳机完全一致，两行才会左对齐
         int gap = icon / 4;
         if (gap < 3) gap = 3;
@@ -715,7 +831,7 @@ public:
         switch (index)
         {
         case TMI_NAME:        return L"无线设备电量";
-        case TMI_DESCRIPTION: return L"以图标显示 AJAZZ 鼠标与 MCHOSE 耳机的电量（HID 直读）";
+        case TMI_DESCRIPTION: return L"以图标显示 AJAZZ 鼠标与 MCHOSE 耳机的电量（HID 直读），带电量变化日志";
         case TMI_AUTHOR:      return L"WorkBuddy";
         case TMI_COPYRIGHT:   return L"";
         case TMI_VERSION:     return L"1.1";
