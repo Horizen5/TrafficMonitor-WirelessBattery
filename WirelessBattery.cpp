@@ -55,6 +55,7 @@ static wchar_t g_log_path[MAX_PATH] = L"";
 static int g_logged_mouse = -2;      // -2 = 还没写过
 static int g_logged_headset = -2;
 static int g_logged_mode = -2;
+static int g_logged_pid = -2;        // 记下命中的 PID，方便事后认"这次是哪种连接"
 
 // 主程序通过 OnExtenedInfo 传来的数值文字颜色（0x00BBGGRR）
 static volatile LONG g_value_color = 0;
@@ -178,22 +179,41 @@ static HANDLE OpenHidDevice(unsigned short vid, unsigned short pid, unsigned sho
 
 // ---------------------------------------------------------------- 鼠标：AJAZZ
 
-// 按指定 PID 试着读一次电量，读不到返回 -1。
-// 无线（接收器 PID）用厂商 feature 协议；有线/充电 PID 下面是死路，见 ReadMouseBattery。
-static int TryReadAjazzBattery(unsigned short pid)
+// AJ159 PRO 换个连接方式就换一个 PID，而且换出来的 PID 事先不可知：
+//   2.4G 接收器      3151:402D   ← 目前唯一能真的读出电量的形态
+//   底座充电 / 插线   3151:4026   ← 固件只回显、不应答（实测 0x00~0x7F 全扫无响应）
+//   蓝牙            未知         ← 要切过去配对后才能扫到
+//
+// 所以不写死 PID：把 VID 3151 下所有 HID 接口过一遍，凡是有 65 字节 vendor feature
+// 通道（UsagePage 0xFFFF）的都试一次厂商协议，谁答话就用谁。
+// 以后换机型、加蓝牙模式，只要固件还讲这套协议，代码就不用动。
+struct AjazzScan
 {
-    HANDLE h = OpenHidDevice(0x3151, pid, 0xFFFF, 0x02, true);
-    if (h == INVALID_HANDLE_VALUE) return -1;
+    int battery;              // -1 = 没有任何接口答话
+    unsigned short bat_pid;   // 答话的那个 PID
+    int present;              // 命中的接口数（判断"设备在、但读不到电量"用）
+    unsigned short seen[8];
+    int seen_count;
+};
 
-    int value = -1;
+static void NoteSeen(AjazzScan* s, unsigned short pid)
+{
+    for (int i = 0; i < s->seen_count; ++i)
+        if (s->seen[i] == pid) return;
+    if (s->seen_count < 8) s->seen[s->seen_count++] = pid;
+}
 
+// 在一路已打开的厂商 feature 口上跑一次协议：先 0xF7 心跳唤醒链路，再读 report 0x05。
+// 布局 05 00 00 <电量>。成功返回 0~100。
+static int ReadAjazzOnHandle(HANDLE h)
+{
     BYTE heartbeat[65] = { 0 };
     heartbeat[0] = 0x00;   // report ID 0
     heartbeat[1] = 0xF7;   // 厂商驱动的心跳，唤醒 2.4G 遥测链路
 
-    for (int attempt = 0; attempt < 3 && value < 0; ++attempt)
+    for (int attempt = 0; attempt < 3; ++attempt)
     {
-        if (!HidD_SetFeature(h, heartbeat, sizeof(heartbeat))) break;
+        if (!HidD_SetFeature(h, heartbeat, sizeof(heartbeat))) return -1;
         WaitForSingleObject(g_stop_event, 45);   // 等一次空中往返
 
         BYTE report[65] = { 0 };
@@ -201,36 +221,112 @@ static int TryReadAjazzBattery(unsigned short pid)
         if (HidD_GetFeature(h, report, sizeof(report)))
         {
             // report[0] 是回显的 report ID，真实数据从 report[1] 开始
-            // 布局: 05 00 00 <电量> ...
             if (report[0] == 0x05 && report[1] == 0x00 && report[2] == 0x00)
             {
                 int level = report[3];
-                if (level >= 0 && level <= 100)
-                    value = level;
+                if (level >= 0 && level <= 100) return level;
             }
         }
         WaitForSingleObject(g_stop_event, 100);
     }
-
-    CloseHandle(h);
-    return value;
+    return -1;
 }
 
-static int ReadMouseBattery(int* mode_out)
+static void ScanAjazz(AjazzScan* out)
+{
+    out->battery = -1;
+    out->bat_pid = 0;
+    out->present = 0;
+    out->seen_count = 0;
+
+    GUID guid = { 0x4D1E55B2, 0xF16F, 0x11CF, { 0x88, 0xCB, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 } }; // GUID_DEVINTERFACE_HID
+    HDEVINFO dev_info = SetupDiGetClassDevsW(&guid, nullptr, nullptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (dev_info == INVALID_HANDLE_VALUE) return;
+
+    SP_DEVICE_INTERFACE_DATA did{};
+    did.cbSize = sizeof(did);
+
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(dev_info, nullptr, &guid, i, &did); ++i)
+    {
+        DWORD needed = 0;
+        SetupDiGetDeviceInterfaceDetailW(dev_info, &did, nullptr, 0, &needed, nullptr);
+        if (needed == 0) continue;
+
+        BYTE* buffer = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, needed);
+        if (!buffer) continue;
+
+        PSP_DEVICE_INTERFACE_DETAIL_DATA_W detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA_W)buffer;
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+
+        if (SetupDiGetDeviceInterfaceDetailW(dev_info, &did, detail, needed, &needed, nullptr))
+        {
+            HANDLE h = CreateFileW(detail->DevicePath,
+                                   GENERIC_READ | GENERIC_WRITE,
+                                   FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                   nullptr, OPEN_EXISTING,
+                                   FILE_FLAG_OVERLAPPED, nullptr);
+            if (h != INVALID_HANDLE_VALUE)
+            {
+                HIDD_ATTRIBUTES attr{};
+                attr.Size = sizeof(attr);
+                if (HidD_GetAttributes(h, &attr) && attr.VendorID == 0x3151)
+                {
+                    ++out->present;
+                    NoteSeen(out, attr.ProductID);
+
+                    // 只对"长得像厂商遥测口"的接口发命令：page 0xFFFF 且 feature 够 65 字节。
+                    // 免得往键盘/多媒体那些接口上乱写。
+                    bool vendor_telemetry = false;
+                    PHIDP_PREPARSED_DATA ppd = nullptr;
+                    if (HidD_GetPreparsedData(h, &ppd))
+                    {
+                        HIDP_CAPS caps{};
+                        if (HidP_GetCaps(ppd, &caps) == HIDP_STATUS_SUCCESS)
+                            vendor_telemetry = (caps.UsagePage == 0xFFFF && caps.FeatureReportByteLength >= 65);
+                        HidD_FreePreparsedData(ppd);
+                    }
+
+                    if (vendor_telemetry && out->battery < 0)
+                    {
+                        int level = ReadAjazzOnHandle(h);
+                        if (level >= 0)
+                        {
+                            out->battery = level;
+                            out->bat_pid = attr.ProductID;
+                        }
+                    }
+                }
+                CloseHandle(h);
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, buffer);
+    }
+
+    SetupDiDestroyDeviceInfoList(dev_info);
+}
+
+static int ReadMouseBattery(int* mode_out, unsigned short* pid_out)
 {
     *mode_out = MODE_NONE;
+    *pid_out = 0;
 
-    // 1) 无线：接收器在，正常读电量
-    int v = TryReadAjazzBattery(0x402D);
-    if (v >= 0) { *mode_out = MODE_WIRELESS; return v; }
+    AjazzScan s;
+    ScanAjazz(&s);
 
-    // 2) 有线/充电：设备还在，但换了 PID，且固件不回应任何命令。
-    //    这里不谎报 0%，交给上层显示"充电"。
-    HANDLE h = OpenHidDevice(0x3151, 0x4026, 0xFFFF, 0x02, true);
-    if (h != INVALID_HANDLE_VALUE)
+    // 判据是"读得到电量"，不是"设备在"。接收器长期插在机上，鼠标切到蓝牙或插了线
+    // 之后它仍然挂在总线里，只是答不出话了 —— 所以光看存在性会把状态判错。
+    if (s.battery >= 0)
     {
-        CloseHandle(h);
+        *mode_out = MODE_WIRELESS;
+        *pid_out = s.bat_pid;
+        return s.battery;
+    }
+
+    if (s.present > 0)
+    {
+        // 底座充电 / 插线：设备在，固件不答话。不谎报 0%，交给上层显示"充电"。
         *mode_out = MODE_WIRED;
+        *pid_out = s.seen_count ? s.seen[0] : 0;
     }
     return -1;
 }
@@ -604,10 +700,11 @@ static void RotateLogIfBig()
     MoveFileExW(g_log_path, old, MOVEFILE_REPLACE_EXISTING);
 }
 
-static void LogBattery(int mouse, int headset, int mode)
+static void LogBattery(int mouse, int headset, int mode, unsigned short pid)
 {
     if (!g_log_path[0]) return;
-    if (mouse == g_logged_mouse && headset == g_logged_headset && mode == g_logged_mode) return;
+    if (mouse == g_logged_mouse && headset == g_logged_headset &&
+        mode == g_logged_mode && (int)pid == g_logged_pid) return;
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -622,10 +719,11 @@ static void LogBattery(int mouse, int headset, int mode)
     else hstr = "none";
 
     char line[192];
-    wsprintfA(line, "%04d-%02d-%02d %02d:%02d:%02d  mouse=%-8s headset=%-6s mode=%s\r\n",
+    wsprintfA(line, "%04d-%02d-%02d %02d:%02d:%02d  mouse=%-8s headset=%-6s mode=%-8s pid=%04X\r\n",
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
               mstr, hstr,
-              mode == MODE_WIRELESS ? "wireless" : (mode == MODE_WIRED ? "wired" : "absent"));
+              mode == MODE_WIRELESS ? "wireless" : (mode == MODE_WIRED ? "wired" : "absent"),
+              pid);
 
     RotateLogIfBig();
 
@@ -642,6 +740,7 @@ static void LogBattery(int mouse, int headset, int mode)
     g_logged_mouse = mouse;
     g_logged_headset = headset;
     g_logged_mode = mode;
+    g_logged_pid = (int)pid;
 }
 
 // ---------------------------------------------------------------- 刷新线程
@@ -653,7 +752,8 @@ static DWORD WINAPI RefreshThread(LPVOID)
     while (WaitForSingleObject(g_stop_event, 0) == WAIT_TIMEOUT)
     {
         int mode = MODE_NONE;
-        int mouse = ReadMouseBattery(&mode);
+        unsigned short pid = 0;
+        int mouse = ReadMouseBattery(&mode, &pid);
         int headset = ReadHeadsetBattery();
 
         EnterCriticalSection(&g_lock);
@@ -679,7 +779,7 @@ static DWORD WINAPI RefreshThread(LPVOID)
         wsprintfW(g_tooltip, L"鼠标：%s ｜ 耳机：%s", mdesc, hdesc);
         LeaveCriticalSection(&g_lock);
 
-        LogBattery(mouse, headset, mode);
+        LogBattery(mouse, headset, mode, pid);
 
         if (WaitForSingleObject(g_stop_event, REFRESH_SECONDS * 1000) != WAIT_TIMEOUT)
             break;
@@ -834,7 +934,7 @@ public:
         case TMI_DESCRIPTION: return L"以图标显示 AJAZZ 鼠标与 MCHOSE 耳机的电量（HID 直读），带电量变化日志";
         case TMI_AUTHOR:      return L"WorkBuddy";
         case TMI_COPYRIGHT:   return L"";
-        case TMI_VERSION:     return L"1.1";
+        case TMI_VERSION:     return L"1.2";
         case TMI_URL:         return L"";
         default:              return L"";
         }
