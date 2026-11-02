@@ -56,6 +56,7 @@ static int g_logged_mouse = -2;      // -2 = 还没写过
 static int g_logged_headset = -2;
 static int g_logged_mode = -2;
 static int g_logged_pid = -2;        // 记下命中的 PID，方便事后认"这次是哪种连接"
+static int g_logged_hs_src = -2;     // 耳机这次是哪个设备答的话
 
 // 主程序通过 OnExtenedInfo 传来的数值文字颜色（0x00BBGGRR）
 static volatile LONG g_value_color = 0;
@@ -332,10 +333,28 @@ static int ReadMouseBattery(int* mode_out, unsigned short* pid_out)
 }
 
 // ---------------------------------------------------------------- 耳机：MCHOSE
+//
+// V9 PRO 有两种形态，电量在**两个不同的 USB 设备**上：
+//   2.4G 无线   291D:385D  MI_00 COL05  page 0xFF90   ← 接收器 dongle
+//   插线声卡模式 0D8C:0343  MI_00 COL04  page 0xFF90   ← 耳机内置的 C-Media 声卡
+// 插线后接收器那个 FF90 口**完全不应答**（实测 got=0），所以必须留两条路，
+// 否则一插线电量就变成 `--`。协议两套完全一样，只是换了个设备。
 
-static int ReadHeadsetBattery()
+struct HeadsetSource
 {
-    HANDLE h = OpenHidDevice(0x291D, 0x385D, 0xFF90, 0x01, true);
+    unsigned short vid, pid;
+    const char*    tag;     // 写进日志，用来确认这次是哪个设备答的话
+};
+
+static const HeadsetSource kHeadsetSources[] = {
+    { 0x291D, 0x385D, "dongle" },   // 2.4G 接收器
+    { 0x0D8C, 0x0343, "usbc"   },   // 插线声卡模式
+};
+
+// 在指定设备上跑一次 55 65 01 协议，读不到返回 -1
+static int ReadHeadsetFrom(unsigned short vid, unsigned short pid)
+{
+    HANDLE h = OpenHidDevice(vid, pid, 0xFF90, 0x01, true);
     if (h == INVALID_HANDLE_VALUE) return -1;
 
     int value = -1;
@@ -370,6 +389,22 @@ static int ReadHeadsetBattery()
 
     CloseHandle(h);
     return value;
+}
+
+// 依次试两条路：先接收器（无线时它最及时），再耳机自己的声卡（插线时只有它答话）
+static int ReadHeadsetBattery(int* src_out)
+{
+    *src_out = -1;
+    for (int i = 0; i < (int)(sizeof(kHeadsetSources) / sizeof(kHeadsetSources[0])); ++i)
+    {
+        int v = ReadHeadsetFrom(kHeadsetSources[i].vid, kHeadsetSources[i].pid);
+        if (v >= 0)
+        {
+            *src_out = i;
+            return v;
+        }
+    }
+    return -1;
 }
 
 // ---------------------------------------------------------------- 图标渲染（GDI+ 矢量）
@@ -700,11 +735,11 @@ static void RotateLogIfBig()
     MoveFileExW(g_log_path, old, MOVEFILE_REPLACE_EXISTING);
 }
 
-static void LogBattery(int mouse, int headset, int mode, unsigned short pid)
+static void LogBattery(int mouse, int headset, int mode, unsigned short pid, int hs_src)
 {
     if (!g_log_path[0]) return;
     if (mouse == g_logged_mouse && headset == g_logged_headset &&
-        mode == g_logged_mode && (int)pid == g_logged_pid) return;
+        mode == g_logged_mode && (int)pid == g_logged_pid && hs_src == g_logged_hs_src) return;
 
     SYSTEMTIME st;
     GetLocalTime(&st);
@@ -718,12 +753,14 @@ static void LogBattery(int mouse, int headset, int mode, unsigned short pid)
     if (headset >= 0) { wsprintfA(hbuf, "%d%%", headset); hstr = hbuf; }
     else hstr = "none";
 
+    const char* hsrc = (hs_src >= 0) ? kHeadsetSources[hs_src].tag : "-";
+
     char line[192];
-    wsprintfA(line, "%04d-%02d-%02d %02d:%02d:%02d  mouse=%-8s headset=%-6s mode=%-8s pid=%04X\r\n",
+    wsprintfA(line, "%04d-%02d-%02d %02d:%02d:%02d  mouse=%-8s headset=%-6s mode=%-8s pid=%04X hs=%s\r\n",
               st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
               mstr, hstr,
               mode == MODE_WIRELESS ? "wireless" : (mode == MODE_WIRED ? "wired" : "absent"),
-              pid);
+              pid, hsrc);
 
     RotateLogIfBig();
 
@@ -741,6 +778,7 @@ static void LogBattery(int mouse, int headset, int mode, unsigned short pid)
     g_logged_headset = headset;
     g_logged_mode = mode;
     g_logged_pid = (int)pid;
+    g_logged_hs_src = hs_src;
 }
 
 // ---------------------------------------------------------------- 刷新线程
@@ -754,7 +792,8 @@ static DWORD WINAPI RefreshThread(LPVOID)
         int mode = MODE_NONE;
         unsigned short pid = 0;
         int mouse = ReadMouseBattery(&mode, &pid);
-        int headset = ReadHeadsetBattery();
+        int hs_src = -1;
+        int headset = ReadHeadsetBattery(&hs_src);
 
         EnterCriticalSection(&g_lock);
         g_mouse_val = mouse;
@@ -779,7 +818,7 @@ static DWORD WINAPI RefreshThread(LPVOID)
         wsprintfW(g_tooltip, L"鼠标：%s ｜ 耳机：%s", mdesc, hdesc);
         LeaveCriticalSection(&g_lock);
 
-        LogBattery(mouse, headset, mode, pid);
+        LogBattery(mouse, headset, mode, pid, hs_src);
 
         if (WaitForSingleObject(g_stop_event, REFRESH_SECONDS * 1000) != WAIT_TIMEOUT)
             break;
